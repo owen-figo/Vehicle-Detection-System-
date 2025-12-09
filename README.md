@@ -1,5 +1,5 @@
-https://www.kaggle.com/datasets/brsdincer/vehicle-detection-image-set/data
-for the dataset
+for the dataset : https://www.kaggle.com/datasets/brsdincer/vehicle-detection-image-set/data
+
 
 requirements for the library
 tensorflow==2.17.1
