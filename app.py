@@ -1,4 +1,3 @@
-
 import os
 import time
 import math
@@ -53,13 +52,39 @@ def sigmoid_conf(score: float) -> float:
     return float(100.0 / (1.0 + np.exp(-score)))
 
 
+def clamp_bbox(bbox, W, H):
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, min(W - 1, int(x1)))
+    y1 = max(0, min(H - 1, int(y1)))
+    x2 = max(0, min(W - 1, int(x2)))
+    y2 = max(0, min(H - 1, int(y2)))
+    if x2 <= x1:
+        x2 = min(W - 1, x1 + 1)
+    if y2 <= y1:
+        y2 = min(H - 1, y1 + 1)
+    return (x1, y1, x2, y2)
+
+
+def bgr_to_rgb(img_bgr: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+
+def norm_to_u8(img_float: np.ndarray) -> np.ndarray:
+    x = img_float.astype(np.float32)
+    x = x - float(np.min(x))
+    denom = float(np.max(x))
+    if denom < 1e-9:
+        return np.zeros_like(x, dtype=np.uint8)
+    x = x / denom
+    return (x * 255.0).astype(np.uint8)
+
+
 # =============================================================
 # FEATURE EXTRACTION
 # =============================================================
 def extract_canny_hog_from_patch(patch_bgr: np.ndarray, canny_t1: int, canny_t2: int) -> np.ndarray:
     patch_bgr = cv2.resize(patch_bgr, (WIN_W, WIN_H))
     gray = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY)
-
     edges = cv2.Canny(gray, canny_t1, canny_t2)
 
     feat = hog(
@@ -73,8 +98,41 @@ def extract_canny_hog_from_patch(patch_bgr: np.ndarray, canny_t1: int, canny_t2:
     return feat.astype(np.float32)
 
 
+def extract_canny_hog_debug(patch_bgr: np.ndarray, canny_t1: int, canny_t2: int, visualize_hog: bool = True):
+    """
+    Debug version to SHOW every stage on a patch:
+      patch -> resize(128x64) -> grayscale -> canny -> HOG(feature vector + optional visualization)
+    """
+    patch_resized = cv2.resize(patch_bgr, (WIN_W, WIN_H))
+    gray = cv2.cvtColor(patch_resized, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, canny_t1, canny_t2)
+
+    if visualize_hog:
+        feat, hog_img = hog(
+            edges,
+            orientations=9,
+            pixels_per_cell=(8, 8),
+            cells_per_block=(2, 2),
+            block_norm="L2-Hys",
+            visualize=True,
+            feature_vector=True
+        )
+    else:
+        feat = hog(
+            edges,
+            orientations=9,
+            pixels_per_cell=(8, 8),
+            cells_per_block=(2, 2),
+            block_norm="L2-Hys",
+            feature_vector=True
+        )
+        hog_img = None
+
+    return feat.astype(np.float32), patch_resized, gray, edges, hog_img
+
+
 def score_patch(patch_bgr: np.ndarray, svm: LinearSVC, scaler: StandardScaler, canny_t1: int, canny_t2: int):
-    feat = extract_canny_hog_from_patch(patch_bgr, canny_t1, canny_t2) 
+    feat = extract_canny_hog_from_patch(patch_bgr, canny_t1, canny_t2)
     feat_scaled = scaler.transform([feat])
     score = float(svm.decision_function(feat_scaled)[0])
     pred = int(svm.predict(feat_scaled)[0])  # 1 if score >= 0, else 0 (for LinearSVC)
@@ -142,15 +200,18 @@ def scan_image_collect_scores(
     pyr_scale: float,
     y_start_ratio: float,
     max_levels: int,
+    collect_level_stats: bool = False,
 ):
     """
     Returns:
-      windows: list of dicts with bbox and score/pred
+      windows: list of dicts with bbox and score/pred/conf
       all_scores: list of float (scores for distribution)
+      (optional) level_stats: list of per-pyramid-level stats for visualization
     """
     H0, W0 = img_bgr.shape[:2]
     windows = []
     all_scores = []
+    level_stats = []
 
     # if too small, just evaluate whole image as one "window"
     if W0 < WIN_W or H0 < WIN_H:
@@ -162,6 +223,18 @@ def scan_image_collect_scores(
             "conf": conf
         })
         all_scores.append(score)
+        if collect_level_stats:
+            level_stats.append({
+                "level": 0,
+                "scale": 1.0,
+                "resized_W": W0,
+                "resized_H": H0,
+                "y_start": 0,
+                "windows": 1,
+                "max_score": score,
+                "p90_score": score
+            })
+            return windows, all_scores, level_stats
         return windows, all_scores
 
     scale = 1.0
@@ -177,9 +250,14 @@ def scan_image_collect_scores(
         resized = cv2.resize(img_bgr, (Ws, Hs), interpolation=cv2.INTER_AREA)
         y_start = int((resized.shape[0]) * y_start_ratio)
 
+        level_scores = []
+        level_win_count = 0
+
         for x, y, win in sliding_window(resized, step, (WIN_W, WIN_H), y_start=y_start):
             pred, score, conf = score_patch(win, svm, scaler, canny_t1, canny_t2)
             all_scores.append(score)
+            level_scores.append(score)
+            level_win_count += 1
 
             # map bbox back to original
             x1 = int(x / scale)
@@ -196,12 +274,34 @@ def scan_image_collect_scores(
                 "bbox": (x1, y1, x2, y2),
                 "pred": pred,
                 "score": score,
-                "conf": conf
+                "conf": conf,
+                "level": levels,
+                "scale": scale
+            })
+
+        if collect_level_stats:
+            if level_win_count > 0:
+                p90 = float(np.percentile(np.array(level_scores, dtype=np.float32), 90))
+                mx = float(np.max(level_scores))
+            else:
+                p90 = float("nan")
+                mx = float("nan")
+            level_stats.append({
+                "level": levels,
+                "scale": float(scale),
+                "resized_W": int(Ws),
+                "resized_H": int(Hs),
+                "y_start": int(y_start),
+                "windows": int(level_win_count),
+                "max_score": mx,
+                "p90_score": p90
             })
 
         scale /= pyr_scale
         levels += 1
 
+    if collect_level_stats:
+        return windows, all_scores, level_stats
     return windows, all_scores
 
 
@@ -450,7 +550,7 @@ def load_or_train_simple(canny_t1: int, canny_t2: int):
 # =============================================================
 def run_app():
     st.title("🚗 Vehicle Detection (1 Box) — Canny + HOG + SVM")
-    st.caption("Includes: hard negative mining, heatmap overlay, YOLO output, and score distribution.")
+    st.caption("Now shows every methodology stage: resize, grayscale, Canny, patch HOG, evaluation, bbox merge, heatmap, export.")
 
     # Sidebar controls
     st.sidebar.header("Detection settings")
@@ -466,6 +566,12 @@ def run_app():
 
     pos_score_thresh = st.sidebar.slider("POS_SCORE_THRESH (vehicle filter)", -2.0, 8.0, 2.5, 0.1)
     top_k = st.sidebar.slider("TOP_K windows to merge", 1, 200, 15, 1)
+
+    st.sidebar.header("Visualization toggles")
+    show_method_steps = st.sidebar.checkbox("Show methodology steps", True)
+    show_level_stats = st.sidebar.checkbox("Show pyramid-level evaluation table", True)
+    show_top_windows = st.sidebar.checkbox("Show top positive windows overlay (optional)", False)
+    top_windows_n = st.sidebar.slider("Top windows to draw", 1, 100, 20, 1) if show_top_windows else 20
 
     show_heatmap = st.sidebar.checkbox("Show heatmap overlay", True)
     heat_blur = st.sidebar.slider("Heatmap blur ksize", 0, 101, 31, 2)
@@ -524,34 +630,95 @@ def run_app():
 
     # Robust decode (avoids PIL.UnidentifiedImageError)
     file_bytes = np.asarray(bytearray(uploaded.getvalue()), dtype=np.uint8)
-    img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    if img_bgr is None:
+    img_bgr_raw = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if img_bgr_raw is None:
         st.error("Failed to decode image. Please upload a valid raster image file.")
         return
 
-    # Speed cap
+    # ---------------------------------------------------------
+    # METHODOLOGY STEP: Speed cap resize (this affects scanning speed)
+    # ---------------------------------------------------------
     max_w = 1100
-    H0, W0 = img_bgr.shape[:2]
-    if W0 > max_w:
-        new_h = int(H0 * (max_w / W0))
+    H_raw, W_raw = img_bgr_raw.shape[:2]
+    img_bgr = img_bgr_raw.copy()
+    resized_for_speed = False
+    if W_raw > max_w:
+        new_h = int(H_raw * (max_w / W_raw))
         img_bgr = cv2.resize(img_bgr, (max_w, new_h), interpolation=cv2.INTER_AREA)
+        resized_for_speed = True
 
-    st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), caption="Uploaded Image", use_column_width=True)
+    H0, W0 = img_bgr.shape[:2]
 
-    # Scan + detect
-    st.subheader("Detection")
-    start = time.time()
-    windows, all_scores = scan_image_collect_scores(
-        img_bgr=img_bgr,
-        svm=svm,
-        scaler=scaler,
-        canny_t1=canny_t1,
-        canny_t2=canny_t2,
-        step=step,
-        pyr_scale=pyr_scale,
-        y_start_ratio=y_start_ratio,
-        max_levels=max_levels,
+    # Show input
+    st.image(bgr_to_rgb(img_bgr), caption="Uploaded Image (used for scanning)", use_column_width=True)
+
+    # Draw scan start line preview
+    scan_preview = img_bgr.copy()
+    y_start_vis = int(H0 * y_start_ratio)
+    cv2.line(scan_preview, (0, y_start_vis), (W0 - 1, y_start_vis), (0, 255, 255), 2)
+    cv2.putText(
+        scan_preview,
+        f"Scan starts at y={y_start_vis} (y_start_ratio={y_start_ratio:.2f})",
+        (10, max(20, y_start_vis - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 255),
+        2
     )
+
+    if show_method_steps:
+        with st.expander("✅ Methodology Steps (Resize → Grayscale → Canny → HOG on Patch)", expanded=True):
+            st.markdown("### 1) Resize (speed cap for scanning)")
+            st.write(f"Original: {W_raw}x{H_raw}  →  Used for scanning: {W0}x{H0}")
+            if resized_for_speed:
+                st.info("Speed cap applied: image width limited to 1100 pixels for faster scanning.")
+            st.image(bgr_to_rgb(img_bgr), caption="Image after speed cap (this is what the scanner uses)", use_column_width=True)
+
+            st.markdown("### 2) Grayscale (global view)")
+            gray_global = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            st.image(gray_global, caption="Global Grayscale", use_column_width=True)
+
+            st.markdown("### 3) Canny Edge Detection (global view)")
+            edges_global = cv2.Canny(gray_global, canny_t1, canny_t2)
+            st.image(edges_global, caption=f"Global Canny Edges (t1={canny_t1}, t2={canny_t2})", use_column_width=True)
+
+            st.markdown("### 4) Scanning Region (evaluation starts below this line)")
+            st.image(bgr_to_rgb(scan_preview), caption="Scan start line (yellow)", use_column_width=True)
+
+    # ---------------------------------------------------------
+    # EVALUATION: scan + collect scores
+    # ---------------------------------------------------------
+    st.subheader("Detection / Evaluation (Sliding Window + Pyramid)")
+    start = time.time()
+
+    if show_level_stats:
+        windows, all_scores, level_stats = scan_image_collect_scores(
+            img_bgr=img_bgr,
+            svm=svm,
+            scaler=scaler,
+            canny_t1=canny_t1,
+            canny_t2=canny_t2,
+            step=step,
+            pyr_scale=pyr_scale,
+            y_start_ratio=y_start_ratio,
+            max_levels=max_levels,
+            collect_level_stats=True,
+        )
+    else:
+        windows, all_scores = scan_image_collect_scores(
+            img_bgr=img_bgr,
+            svm=svm,
+            scaler=scaler,
+            canny_t1=canny_t1,
+            canny_t2=canny_t2,
+            step=step,
+            pyr_scale=pyr_scale,
+            y_start_ratio=y_start_ratio,
+            max_levels=max_levels,
+            collect_level_stats=False,
+        )
+        level_stats = None
+
     bbox, best_score, best_conf, used_count = merge_topk_boxes(windows, pos_score_thresh, top_k)
     runtime = time.time() - start
 
@@ -562,6 +729,7 @@ def run_app():
 
     scores_np = np.array(all_scores, dtype=np.float32)
     st.write(f"Windows evaluated: **{len(all_scores)}**")
+    st.write(f"Runtime (scan + scoring + merge): **{runtime:.4f} s**")
     st.write(
         f"Score stats: min **{float(scores_np.min()):.3f}**, "
         f"p50 **{float(np.percentile(scores_np, 50)):.3f}**, "
@@ -569,6 +737,10 @@ def run_app():
         f"p99 **{float(np.percentile(scores_np, 99)):.3f}**, "
         f"max **{float(scores_np.max()):.3f}**"
     )
+
+    if show_level_stats and level_stats is not None:
+        st.markdown("#### Pyramid-level evaluation summary")
+        st.dataframe(level_stats, use_container_width=True)
 
     if show_hist:
         fig = plt.figure()
@@ -578,13 +750,36 @@ def run_app():
         plt.ylabel("count")
         st.pyplot(fig, clear_figure=True)
 
-    # Draw results
+    # ---------------------------------------------------------
+    # Bounding Box + (optional) top windows visualization
+    # ---------------------------------------------------------
+    st.subheader("Bounding Box (Top-K Merge Output)")
     vis = img_bgr.copy()
+
+    if show_top_windows:
+        positives = [w for w in windows if w["score"] >= pos_score_thresh]
+        positives.sort(key=lambda w: w["score"], reverse=True)
+        positives = positives[:top_windows_n]
+
+        for w in positives:
+            x1, y1, x2, y2 = clamp_bbox(w["bbox"], W0, H0)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 1)
+
+        cv2.putText(
+            vis,
+            f"Top {len(positives)} positive windows (red) drawn",
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2
+        )
+
     if bbox is None:
         st.warning("No vehicle box found (try lowering POS_SCORE_THRESH or TOP_K / increase scanning region).")
-        st.write(f"Runtime: {runtime:.4f}s")
+        st.image(bgr_to_rgb(vis), caption="No merged box (optional windows may still be drawn)", use_column_width=True)
     else:
-        x1, y1, x2, y2 = bbox
+        x1, y1, x2, y2 = clamp_bbox(bbox, W0, H0)
         label = "Vehicle"
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(
@@ -597,17 +792,35 @@ def run_app():
             2
         )
 
-        st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption="Result (1 merged box)", use_column_width=True)
-        st.success(f"Runtime: {runtime:.4f} seconds")
+        st.image(bgr_to_rgb(vis), caption="Result (1 merged box)", use_column_width=True)
 
         # YOLO-style output (single line)
-        H, W = img_bgr.shape[:2]
-        yolo_line = bbox_to_yolo_line(bbox, img_w=W, img_h=H, class_id=0)
-        st.subheader("YOLO-style output (single bbox)")
+        yolo_line = bbox_to_yolo_line((x1, y1, x2, y2), img_w=W0, img_h=H0, class_id=0)
+        st.subheader("Export: YOLO-style output (single bbox)")
         st.code(yolo_line, language="text")
         st.caption("Format: class_id x_center y_center width height (all normalized 0..1)")
 
+        # Download exports
+        st.subheader("Export Files")
+        st.download_button(
+            "⬇️ Download YOLO .txt",
+            data=(yolo_line + "\n").encode("utf-8"),
+            file_name="prediction.txt",
+            mime="text/plain"
+        )
+
+        ok_img, buf_img = cv2.imencode(".png", vis)
+        if ok_img:
+            st.download_button(
+                "⬇️ Download Result Image (.png)",
+                data=buf_img.tobytes(),
+                file_name="result.png",
+                mime="image/png"
+            )
+
+    # ---------------------------------------------------------
     # Heatmap overlay
+    # ---------------------------------------------------------
     if show_heatmap:
         st.subheader("Heatmap (score map overlay)")
         overlay, heat_u8 = build_heatmap_overlay(
@@ -616,12 +829,64 @@ def run_app():
             step=step,
             blur_ksize=int(heat_blur) if heat_blur > 0 else 0,
         )
-        st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), caption="Heatmap overlay (red=high score)", use_column_width=True)
+        st.image(bgr_to_rgb(overlay), caption="Heatmap overlay (red=high score)", use_column_width=True)
 
-    # Canny edge visualization
-    st.subheader("Canny edges")
+        ok_heat, buf_heat = cv2.imencode(".png", overlay)
+        if ok_heat:
+            st.download_button(
+                "⬇️ Download Heatmap Overlay (.png)",
+                data=buf_heat.tobytes(),
+                file_name="heatmap_overlay.png",
+                mime="image/png"
+            )
+
+    # ---------------------------------------------------------
+    # Global Canny edge visualization (already in your code)
+    # ---------------------------------------------------------
+    st.subheader("Canny edges (global)")
     edges = cv2.Canny(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), canny_t1, canny_t2)
-    st.image(edges, caption="Canny Edge Map", use_column_width=True)
+    st.image(edges, caption="Canny Edge Map (global)", use_column_width=True)
+
+    ok_edges, buf_edges = cv2.imencode(".png", edges)
+    if ok_edges:
+        st.download_button(
+            "⬇️ Download Global Canny Edges (.png)",
+            data=buf_edges.tobytes(),
+            file_name="canny_edges.png",
+            mime="image/png"
+        )
+
+    # ---------------------------------------------------------
+    # Patch-level demonstration (HOG is computed on 128x64 patches)
+    # ---------------------------------------------------------
+    st.subheader("Patch-level Feature Extraction Demo (128×64 patch)")
+    if len(windows) > 0:
+        # pick best-scoring window for demo (even if bbox None)
+        best_win = max(windows, key=lambda w: w["score"])
+        bx1, by1, bx2, by2 = clamp_bbox(best_win["bbox"], W0, H0)
+        patch = img_bgr[by1:by2, bx1:bx2].copy()
+
+        feat_vec, patch_resized, patch_gray, patch_edges, hog_img = extract_canny_hog_debug(
+            patch_bgr=patch,
+            canny_t1=canny_t1,
+            canny_t2=canny_t2,
+            visualize_hog=True
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.image(bgr_to_rgb(patch), caption=f"Best window patch (bbox={bx1},{by1},{bx2},{by2})", use_column_width=True)
+            st.image(bgr_to_rgb(patch_resized), caption="Patch resized to 128×64", use_column_width=True)
+        with c2:
+            st.image(patch_gray, caption="Patch grayscale", use_column_width=True)
+            st.image(patch_edges, caption="Patch Canny edges (input to HOG)", use_column_width=True)
+
+        st.write(f"HOG feature vector length: **{len(feat_vec)}**")
+        st.write(f"Best-window score: **{best_win['score']:.3f}** | conf(sigmoid): **{best_win['conf']:.1f}%** | pred: **{best_win['pred']}**")
+
+        if hog_img is not None:
+            hog_u8 = norm_to_u8(hog_img)
+            st.image(hog_u8, caption="HOG visualization (for illustration of gradient structure)", use_column_width=True)
 
     # Helpful hint
     st.info(
